@@ -1,0 +1,119 @@
+name: ChatGPT temporary APK build
+
+on:
+  push:
+    branches:
+      - chatgpt-apk-build-20260909-1722
+    paths:
+      - .github/workflows/chatgpt-apk-build.yml
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out temporary branch
+        uses: actions/checkout@v4
+        with:
+          ref: chatgpt-apk-build-20260909-1722
+          fetch-depth: 0
+
+      - name: Generate and publish ephemeral encryption key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ci
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out /tmp/private.pem
+          openssl pkey -in /tmp/private.pem -pubout -out .ci/public_key.pem
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .ci/public_key.pem
+          git commit -m "ci: publish ephemeral APK build key" || true
+          git push origin HEAD:chatgpt-apk-build-20260909-1722
+
+      - name: Wait for encrypted project payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 180); do
+            git fetch origin chatgpt-apk-build-20260909-1722 --quiet
+            if git show origin/chatgpt-apk-build-20260909-1722:.ci/payload.json > /tmp/payload.json 2>/dev/null; then
+              echo "Encrypted payload marker received."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for encrypted payload." >&2
+          exit 1
+
+      - name: Retrieve and decrypt project
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA=$(jq -r '.source_blob_sha' /tmp/payload.json)
+          KEY_SHA=$(jq -r '.key_blob_sha' /tmp/payload.json)
+          fetch_blob() {
+            local sha="$1"
+            curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/blobs/${sha}" \
+              | jq -r '.content' | tr -d '\n' | base64 -d
+          }
+          fetch_blob "$SOURCE_SHA" > /tmp/source.enc
+          fetch_blob "$KEY_SHA" > /tmp/key.enc
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/private.pem \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -in /tmp/key.enc \
+            -out /tmp/passphrase
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+            -in /tmp/source.enc \
+            -out /tmp/project.zip \
+            -pass file:/tmp/passphrase
+          rm -rf project
+          mkdir project
+          unzip -q /tmp/project.zip -d project
+          test -f project/settings.gradle.kts
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 9.6.0
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Install Android SDK 37
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-37" "build-tools;36.0.0"
+
+      - name: Build installable debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd project
+          gradle :app:assembleDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/Tuimeltrein-Exam-Mastery-v2.3-Android16.apk"
+          sha256sum "$GITHUB_WORKSPACE/Tuimeltrein-Exam-Mastery-v2.3-Android16.apk"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tuimeltrein-Exam-Mastery-v2.3-Android16
+          path: Tuimeltrein-Exam-Mastery-v2.3-Android16.apk
+          if-no-files-found: error
+          retention-days: 1
